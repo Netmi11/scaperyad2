@@ -3,17 +3,15 @@ import fs from "fs";
 import { writeFile, mkdir, readFile } from "fs/promises";
 import fetch from "node-fetch";
 import pLimit from "p-limit";
+import * as XLSX from 'xlsx';
 
-var apiToken : string | null = "";
 let config: Config | undefined;
 try {
   config = require("./config.json");
   console.log("Config loaded successfully");
 } catch (error) {
-  console.log("config.json file not found or invalid. Will try to use environment variables instead.");
+  console.log("config.json file not found or invalid.");
 }
-
-apiToken = process.env.API_TOKEN || config?.telegramApiToken || null;
 
 // Interfaces for project configuration
 interface Project {
@@ -23,12 +21,10 @@ interface Project {
 }
 
 interface Config {
-  telegramApiToken: string | null;
-  users: Record<string, User>; // Users is an object with string keys and User values
+  users: Record<string, User>;
 }
 
 interface User {
-  chatId: string | null;
   projects: Project[];
 }
 
@@ -122,34 +118,53 @@ const scrapeItemsAndExtractAdDetails = async (url: string): Promise<any[]> => {
   const yad2Html = await getYad2Response(url);
   const $ = cheerio.load(yad2Html);
 
-  // Define possible selectors for feed items to make the scraper resilient to HTML changes
   const possibleSelectors = ["[data-testid='item-basic']"];
   let $feedItems;
 
-  // Attempt to find the feed items using different selectors
   for (const selector of possibleSelectors) {
     $feedItems = $(selector);
     if ($feedItems.length) {
-      // console.log(`Feed items found using selector: ${selector}`);
       break;
     }
   }
 
   if (!$feedItems || !$feedItems.length) {
-    console.error("No feed items found on the page after trying multiple selectors");
-    throw new Error("Could not find feed items on the page");
+    console.log("No more ads found - reached end of listings");
+    return [];
   }
 
-  // Extract ad details dynamically, accounting for different potential structures
   const adDetails: Record<string, string>[] = [];
   $feedItems.each((_, elm) => {
-    // console.log(elm);
     const imageUrl = $(elm).find("img[data-testid='image']").attr("src");
     const address = $(elm).find("[class^=item-data-content_heading]").eq(1).text().trim();
     const description = $(elm).find("[class^='item-data-content_itemInfoLine']").first().text().trim();
     const structure = $(elm).find("[class^=item-data-content_itemInfoLine]").eq(1).text().trim();
     const price = $(elm).find("span[data-testid='price']").text().trim();
     const relativeLink = $(elm).find('a[class^="item-layout_itemLink"]').attr("href");
+
+    // Extract floor, rooms, and square meters from structure
+    const structureText = structure.toLowerCase();
+    let floor = "";
+    let rooms = "";
+    let squareMeters = "";
+
+    // Extract floor
+    const floorMatch = structureText.match(/קומה\s*(\d+)/);
+    if (floorMatch) {
+      floor = floorMatch[1];
+    }
+
+    // Extract rooms
+    const roomsMatch = structureText.match(/(\d+(?:\.5)?)\s*חדרים/);
+    if (roomsMatch) {
+      rooms = roomsMatch[1];
+    }
+
+    // Extract square meters
+    const metersMatch = structureText.match(/(\d+)\s*מ"ר/);
+    if (metersMatch) {
+      squareMeters = metersMatch[1];
+    }
 
     let fullLink = "";
     if (relativeLink) {
@@ -162,8 +177,11 @@ const scrapeItemsAndExtractAdDetails = async (url: string): Promise<any[]> => {
       imageUrl: imageUrl || "",
       address,
       description,
-      structure,
+      floor,
+      rooms,
+      squareMeters,
       price,
+      structure
     });
   });
 
@@ -171,10 +189,32 @@ const scrapeItemsAndExtractAdDetails = async (url: string): Promise<any[]> => {
   return adDetails;
 };
 
+// Function to save data to Excel
+const saveToExcel = async (ads: any[], topic: string): Promise<void> => {
+  console.log(`Saving ${ads.length} ads to Excel for topic: ${topic}`);
+  
+  // Create workbook and worksheet
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.json_to_sheet(ads);
+  
+  // Add worksheet to workbook
+  XLSX.utils.book_append_sheet(wb, ws, topic);
+  
+  // Create data directory if it doesn't exist
+  if (!fs.existsSync("data")) {
+    await mkdir("data", { recursive: true });
+  }
+  
+  // Write to file
+  const fileName = `./data/${topic}_${new Date().toISOString().split('T')[0]}.xlsx`;
+  XLSX.writeFile(wb, fileName);
+  console.log(`Data saved to ${fileName}`);
+};
+
 // Function to check for new items and update saved items list
 const checkForNewItems = async (ads: any[], topic: string, user: User): Promise<any[]> => {
   console.log(`Checking for new items for topic: ${topic}`);
-  const filePath = `./data/${user.chatId}_${topic}.json`;
+  const filePath = `./data/${topic}.json`;
   let savedAds = new Set<string>();
 
   try {
@@ -192,7 +232,9 @@ const checkForNewItems = async (ads: any[], topic: string, user: User): Promise<
       }
     } else {
       console.log(`Data file for topic ${topic} does not exist. Creating new file.`);
-      await mkdir("data", { recursive: true });
+      if (!fs.existsSync("data")) {
+        await mkdir("data", { recursive: true });
+      }
       await writeFile(filePath, "[]");
     }
   } catch (e) {
@@ -206,7 +248,7 @@ const checkForNewItems = async (ads: any[], topic: string, user: User): Promise<
     newItems.forEach((ad) => savedAds.add(ad.imageUrl));
     await writeFile(filePath, JSON.stringify(Array.from(savedAds), null, 2));
     console.log(`Updated saved ads for topic: ${topic}`);
-    await createPushFlagForWorkflow();
+    await saveToExcel(newItems, topic);
   }
   return newItems;
 };
@@ -217,139 +259,78 @@ const createPushFlagForWorkflow = async (): Promise<void> => {
   await writeFile("push_me", "");
 };
 
-// Function to send a message via Telegram API
-const sendTelegramMessage = async (chatId: string, text: string): Promise<void> => {
-  const url = `https://api.telegram.org/bot${apiToken}/sendMessage`;
-  const payload = {
-    chat_id: chatId,
-    text,
-  };
-
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to send message: ${response.statusText}`);
-    }
-    console.log(`Message sent successfully to chatId: ${chatId}`);
-  } catch (error) {
-    console.error("Error sending message via Telegram API", error);
-    throw error;
-  }
-};
-
-// Function to send a photo message via Telegram API
-const sendTelegramPhotoMessage = async (
-  chatId: string,
-  photoUrl: string,
-  caption: string
-): Promise<void> => {
-  const url = `https://api.telegram.org/bot${apiToken}/sendPhoto`;
-  const payload = {
-    chat_id: chatId,
-    photo: photoUrl,
-    caption,
-  };
-
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to send photo message: ${response.statusText}`);
-    }
-    console.log(`Photo message sent successfully to chatId: ${chatId}`);
-  } catch (error) {
-    console.error("Error sending photo via Telegram API", error);
-    throw error;
-  }
-};
-
-// Function to perform scraping and send Telegram notifications
-const scrape = async (topic: string, url: string, user : User): Promise<void> => {
+// Function to perform scraping and save to Excel
+const scrape = async (topic: string, url: string, user: User): Promise<void> => {
   console.log(`Starting scrape for topic: ${topic}`);
-  const chatId = user.chatId;
-  if (!apiToken || !chatId) {
-    console.error("Missing API_TOKEN or CHAT_ID");
-    throw new Error("Missing API_TOKEN or CHAT_ID");
-  }
-
   try {
-    console.log(`Sent start message for topic: ${topic}`);
-    const scrapeResults = await scrapeItemsAndExtractAdDetails(url);
-    const newItems = await checkForNewItems(scrapeResults, topic, user);
+    let allAds: any[] = [];
+    let page = 1;
+    let hasMorePages = true;
 
-    for (const item of newItems) {
-      const msg = `${item.address}\n${item.description}\n${item.structure}\n${item.price}\n\n${item.fullLink}`;
-      if (item.imageUrl) {
-        await sendTelegramPhotoMessage(chatId, item.imageUrl, msg);
+    while (hasMorePages) {
+      const pageUrl = `${url}&page=${page}`;
+      console.log(`Scraping page ${page} from URL: ${pageUrl}`);
+      const ads = await scrapeItemsAndExtractAdDetails(pageUrl);
+      if (ads.length === 0) {
+        hasMorePages = false;
       } else {
-        await sendTelegramMessage(chatId, msg);
+        allAds = allAds.concat(ads);
+        page++;
       }
-      console.log(`Sent new item to chatId: ${chatId}`);
-    }    
-  } catch (e: any) {
-    const errMsg = e?.message || "Unknown error occurred";
-    // await sendTelegramMessage(chatId, `Scan workflow failed for ${topic}... 😥`);
-    console.error("Error during scraping", e);
+    }
+
+    console.log(`Total ads scraped: ${allAds.length}`);
+    const newItems = await checkForNewItems(allAds, topic, user);
+    if (newItems.length > 0) {
+      console.log(`Found ${newItems.length} new items for topic: ${topic}`);
+      await createPushFlagForWorkflow();
+    } else {
+      console.log(`No new items found for topic: ${topic}`);
+    }
+  } catch (error) {
+    console.error(`Error scraping topic ${topic}:`, error);
+    throw error;
   }
 };
 
 // Main function to iterate through all projects and perform scraping
 const main = async (userToScrape: string, topic: string): Promise<void> => {
   console.log("Starting main scraping process");
-  const configData: Config = config;
-  const limit = pLimit(3);
-  const users = process.env.USERS ? JSON.parse(process.env.USERS) as Record<string, User> 
-                                  : configData.users;
-  if (!users) {
-    console.error("No users found in configuration");
-    return;
+  console.log(`Scraping for user: ${userToScrape}, topic: ${topic}`);
+
+  if (!config) {
+    throw new Error("Configuration not found");
   }
 
-  const userNames = userToScrape ? [userToScrape] : Object.keys(users);
+  const user = config.users[userToScrape];
+  if (!user) {
+    throw new Error(`User ${userToScrape} not found in configuration`);
+  }
 
-  for (const currentUserName of userNames) {
-    console.log(`Scraping for user: ${currentUserName}, topic: ${topic}`);
+  const limit = pLimit(3); // Limit concurrent requests to 3
+  const scrapePromises: Promise<void>[] = [];
 
-    const scrapePromises = users[currentUserName].projects
-      .filter((project) => {
-        if (project.disabled) {
-          console.log(`Topic "${project.topic}" is disabled. Skipping.`);
-          return false;
-        }
-        if (topic && project.topic !== topic) {
-          console.log(`Topic "${project.topic}" does not match the specified topic "${topic}". Skipping.`);
-          return false;
-        }
+  if (topic) {
+    const project = user.projects.find((p) => p.topic === topic);
+    if (project && !project.disabled) {
+      console.log(`Adding topic "${topic}" to scraping queue`);
+      scrapePromises.push(limit(() => scrape(topic, project.url, user)));
+    }
+  } else {
+    user.projects.forEach((project) => {
+      if (!project.disabled) {
         console.log(`Adding topic "${project.topic}" to scraping queue`);
-        return true;
-      })
-      .map((project) =>
-        limit(() =>
-          scrape(project.topic, project.url, users[currentUserName]).catch((e) => {
-            console.error(`Error scraping topic: ${project.topic}`, e);
-          })
-        )
-      );
-
-    await Promise.all(scrapePromises);
+        scrapePromises.push(limit(() => scrape(project.topic, project.url, user)));
+      }
+    });
   }
 
+  await Promise.all(scrapePromises);
   console.log("Completed all scraping tasks");
 };
 
-// Execute the main program
-main('', '').catch((e) => {
-  console.error("Unhandled error in the program", e);
+// Run the scraper
+main("default_user", "neot_rachel_sales").catch((error) => {
+  console.error("Error in main process:", error);
   process.exit(1);
 });

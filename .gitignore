@@ -179,3 +179,8 @@ localTests.js
 .DS_Store
 
 config.json
+
+data/
+*.log
+.DS_Store
+push_me

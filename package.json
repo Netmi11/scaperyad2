@@ -16,6 +16,7 @@
     "cheerio": "^1.0.0",
     "node-fetch": "^3.3.2",
     "p-limit": "^6.1.0",
-    "telenode-js": "^1.5.2"
+    "telenode-js": "^1.5.2",
+    "xlsx": "^0.18.5"
   }
 }
